@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+#
+import sys
+import getopt
+import getpass
+import json
+import couchdb
+
+def usage():
+    print('usage:  persodump  [ -p password ]  user  account',
+            file=sys.stderr)
+    sys.exit(1)
+
+class DBDump:
+    def dump_account(self, user, password, account):
+        """ Dump an account.
+        """
+        server = couchdb.Server(self._format_server_url(user, password))
+
+        # Our databases are defined by the user name plus the suffix '_tractdb'
+        dbname = '{:s}_tractdb'.format(account)
+
+        # Confirm the database exists
+        if dbname not in server:
+            raise Exception('Database "{:s}" does not exist.'.format(dbname))
+
+        # Get the database and iterate over the documents
+        database = server[dbname]
+        print('[')
+        first = True
+        for docid in database:
+            if not first:
+                print(',')
+            first = False
+            json.dump(database[docid], sys.stdout, default=lambda o: o.__dict__,
+                                sort_keys=True, indent=4)
+        print('\n]')
+
+    def _format_server_url(self, user, password):
+        return 'https://' + user + ':' + password + '@tractdb.org/couch/'
+
+
+def main():
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], 'p:')
+    except getopt.GetoptError as err:
+        print('persodump: ' + str(err), file=sys.stderr)
+        usage()
+    if len(args) != 2:
+        usage()
+    optd = dict(opts)
+    if '-p' in optd:
+        password = optd['-p']
+    else:
+        password = getpass.getpass()
+    dumper = DBDump()
+    dumper.dump_account(args[0], password, args[1])
+
+main()

@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+#
+# activity     TummyTrials activity summary for one TractDB account
+#
+import sys
+import io
+import datetime
+import json
+
+def usage():
+    print('usage:  activity  account-json  [ trial-id ]', file=sys.stderr)
+    print('    trial-id    Couch trial id; none = list trials', file=sys.stderr)
+    sys.exit(1)
+
+
+def is_trial(doc):
+    # Return true iff the document is a TummyTrials trial with a
+    # starting and ending time.
+    #
+    try:
+        return doc['doctype']['name'] == 'activity' and \
+                doc['datatype']['name'] == 'tummytrials_experiment' and \
+                'start_time' in doc and 'end_time' in doc
+    except:
+        return False
+
+
+def is_log(doc):
+    # Return true iff the document is a TummyTrials log with a
+    # starting time and message list.
+    #
+    try:
+        return doc['doctype']['name'] == 'log' and \
+                doc['datatype']['name'] == 'tummytrials_log' and \
+                'start_time' in doc and 'messages' in doc
+    except:
+        return False
+
+
+def get_documents(jsonfn):
+    with io.open(jsonfn) as f:
+        res = json.load(f)
+        if not isinstance(res, list):
+            print('activity: ill formed account json file:', jsonfn,
+                    file=sys.stderr)
+            sys.exit(1)
+        return res
+
+
+def list_trials(docs):
+    trials = []
+    for doc in docs:
+        if is_trial(doc):
+            trials.append(doc)
+    trials.sort(key=lambda d: d['start_time'])
+    for t in trials:
+        print('{:20}  {!s:10}  {}'.format(
+            t['_id'],
+            datetime.date.fromtimestamp(t['start_time']),
+            t['name']))
+
+
+def find_cur_trial(docs):
+    # Return the trial with the most recent starting time, or None if
+    # there are no trials.
+    #
+    res = None
+    restime = 0
+    for doc in docs:
+        if is_trial(doc):
+            if res == None:
+                res = doc
+                restime = doc['start_time']
+            elif doc['start_time'] > restime:
+                res = doc
+                restime = doc['start_time']
+    return res
+
+
+def find_trial(docs, id):
+    # Return the trial with the given id, or None if there is no such.
+    #
+    for doc in docs:
+        if is_trial(doc) and doc['_id'] == id:
+            return doc
+    return None
+
+
+def find_log_docs(docs):
+    # Return the TummyTrials log documents
+    #
+    return list(filter(is_log, docs))
+
+
+# A log message looks like this:
+# 
+#   Category~rest of message
+#
+# Categories right now are: Activity, Navigation
+#
+# Rest of message has space-separated fields. Assume any new fields will
+# be added at the end. At the front right now for Activity messages
+# there are the following:
+#
+#   0 - 6  Date and time
+#   7      [INFO]
+#   8      Timestamp
+#   9      URL
+#   10     Trial id
+#   11     Event type (appActive, appPause, etc.)
+# 
+
+
+def active_app_intervals(logs, start, end):
+    # Return intervals where app was active, as a list of tuples:
+    # (start, duration). Starts are millisec epoch values, durations in
+    # millisec.
+    #
+    def start_evt(evt):
+        return evt == 'appActive' or evt == 'appResume' or evt == 'appStartup'
+
+    def stop_evt(evt):
+        return evt == 'appPause' or evt == 'appResign'
+
+    # Allow final app close up to 10 min after last open
+    closelim = 600000
+
+    events = []
+    closer = None # Possible closer for trailing open interval
+    for log in logs:
+        for msg in log['messages']:
+            pcs = msg.split('~')
+            if len(pcs) < 2 or pcs[0] != 'Activity':
+                continue
+            pcs = pcs[1].split(' ')
+            ts = int(pcs[8])
+            if ts >= start and ts < end:
+                events.append((ts, pcs[11]))
+            if ts >= end and stop_evt(pcs[11]):
+                if closer == None or ts < closer[0]:
+                    closer = (ts, pcs[11])
+
+    events.sort(key=lambda ab: ab[0])
+
+    evedge = []
+    if len(events) > 0 and start_evt(events[0][1]):
+        active = False
+    else:
+        active = True
+
+    for ev in events:
+        if active and stop_evt(ev[1]):
+            evedge.append(ev)
+            active = False
+        elif not active and start_evt(ev[1]):
+            evedge.append(ev)
+            active = True
+
+    if len(evedge) > 0 and stop_evt(evedge[0][1]):
+        del evedge[0]
+    last = len(evedge) - 1
+    if len(evedge) > 0 and start_evt(evedge[last][1]):
+        if closer != None and closer[0] < evedge[last][0] + closelim:
+            evedge.append(closer)
+        else:
+            del evedge[last]
+
+    res = []
+    for i in range(0, len(evedge), 2):
+        res.append((evedge[i][0], evedge[i + 1][0] - evedge[i][0]))
+
+    return res
+
+
+def activity(trial, logs):
+    # For each day:
+    # month, day, year
+    # reminder_times { type => millisec after midnight }
+    #    types from remdescs
+    # report_times { type => millisec after midnight }
+    #    types: morning, breakfast, lunch, symptom, confirm
+    # report_histories { type => array of millisec after midnight }
+    #    types: breakfast, lunch, symptom
+    # active: array of (millisec after midnight, millisec of duration)
+    #
+    secpd = 24 * 60 * 60 # Seconds per day
+
+    def hist_times(hist, midn):
+        # A history is a list of dicts each with a report time in
+        # seconds. Return a list of just the times scaled to millisec
+        # and rebased to the given midnight.
+        #
+        return map(lambda d: d['report_time'] * 1000 - midn, hist)
+
+    startms = trial['start_time'] * 1000
+    endms = trial['end_time'] * 1000
+    intervals = active_app_intervals(logs, startms, endms)
+    intervix = 0
+
+    res = []
+
+    days = round((trial['end_time'] - trial['start_time']) / secpd)
+    for dx in range(days):
+        midn = trial['start_time'] + dx * secpd # Beginning of the trial day
+        dxdate = datetime.date.fromtimestamp(midn)
+        dayob = {}
+        dayob['day'] = dxdate.day;
+        dayob['month'] = dxdate.month;
+        dayob['year'] = dxdate.year;
+        midn = midn * 1000                      # Scaled to millisec
+        remob = {}
+        if 'remdescrs' in trial:
+            for rd in trial['remdescrs']:
+                remob[rd['type']] = rd['time'] * 1000 
+        dayob['reminder_times'] = remob
+        repob = {}
+        histob = {}
+        if 'reports' in trial and len(trial['reports']) > dx:
+            if trial['reports'][dx] == None:
+                repdx = {}
+            else:
+                repdx = trial['reports'][dx]
+            if 'morning_reminded_time' in repdx:
+                repob['morning'] = \
+                    repdx['morning_reminded_time'] * 1000 - midn
+            if 'breakfast_report_time' in repdx:
+                repob['breakfast'] = \
+                    repdx['breakfast_report_time'] * 1000 - midn
+            if 'lunch_report_time' in repdx:
+                repob['lunch'] = \
+                    repdx['lunch_report_time'] * 1000 - midn
+            if 'symptom_report_time' in repdx:
+                repob['symptom'] = \
+                    repdx['symptom_report_time'] * 1000 - midn
+            if 'confirmed_time' in repdx:
+                repob['confirm'] = \
+                    repdx['confirmed_time'] * 1000 - midn
+            if 'breakfast_history' in repdx:
+                histob['breakfast'] = \
+                    hist_times(repdx['breakfast_history'], midn)
+            if 'lunch_history' in repdx:
+                histob['lunch'] = \
+                    hist_times(repdx['lunch_history'], midn)
+            if 'symptom_history' in repdx:
+                histob['symptom'] = \
+                    hist_times(repdx['symptom_history'], midn)
+        dayob['report_times'] = repob
+        dayob['report_histories'] = histob
+        tomw = midn + secpd * 1000
+        active = []
+        while intervix < len(intervals) and intervals[intervix][0] < tomw:
+            relms = intervals[intervix][0] - midn # Relative to midnight
+            active.append((relms, intervals[intervix][1]))
+            intervix = intervix + 1
+        dayob['active'] = active
+        res.append(dayob)
+
+    return res
+
+
+def main():
+    if len(sys.argv) == 2:
+        docs = get_documents(sys.argv[1])
+        list_trials(docs)
+        sys.exit(0)
+
+    if len(sys.argv) != 3:
+        usage()
+
+    docs = get_documents(sys.argv[1])
+    if sys.argv[2] == 'cur':
+        trial = find_cur_trial(docs)
+    else:
+        trial = find_trial(docs, sys.argv[2])
+    if trial == None:
+        print('activity: no trial found', file=sys.stderr)
+        sys.exit(1)
+    logs = find_log_docs(docs)
+    actob = activity(trial, logs)
+    json.dump(actob, sys.stdout, default=lambda o: o.__dict__,
+                        sort_keys=True, indent=4)
+
+main()
