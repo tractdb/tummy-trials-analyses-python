@@ -7,6 +7,8 @@ import io
 import datetime
 import json
 
+g_msecpd = 24 * 60 * 60 * 1000 # Millisec per day
+
 def usage():
     print('usage:  activity  account-json  [ trial-id ]', file=sys.stderr)
     print('    trial-id    Couch trial id; none = list trials', file=sys.stderr)
@@ -68,10 +70,7 @@ def find_cur_trial(docs):
     restime = 0
     for doc in docs:
         if is_trial(doc):
-            if res == None:
-                res = doc
-                restime = doc['start_time']
-            elif doc['start_time'] > restime:
+            if res == None or doc['start_time'] > restime:
                 res = doc
                 restime = doc['start_time']
     return res
@@ -84,6 +83,20 @@ def find_trial(docs, id):
         if is_trial(doc) and doc['_id'] == id:
             return doc
     return None
+
+
+def find_following_trial(docs, trial):
+    # Return the earliest trial after the given one, or None if there is
+    # no such.
+    #
+    res = None
+    restime = 0
+    for doc in docs:
+        if is_trial(doc) and doc['start_time'] >= trial['end_time']:
+            if res == None or doc['start_time'] < restime:
+                res = doc
+                restime = doc['start_time']
+    return res
 
 
 def find_log_docs(docs):
@@ -109,6 +122,36 @@ def find_log_docs(docs):
 #   10     Trial id
 #   11     Event type (appActive, appPause, etc.)
 # 
+
+# Navigation messages have the following fields:
+#
+#   0 - 6  Date and time
+#   7      [INFO]
+#   8      Timestamp
+#   9      URL
+#   10     Trial id
+#   11     Event type ($locationChangeSuccess)
+#   12     Timestamp of navigational touch
+#   13     Attribute that did navigation (ui-sref)
+#   14     Containing HTML element (A)
+#   15     Text inside the HTML element (quoted string)
+# 
+
+
+def end_of_log(logs):
+    # Return the timestamp (millisec since Epoch) of the end of the
+    # logs. If there are no logs, return 0 (i.e., Jan 1970).
+    #
+    res = -1
+    for log in logs:
+        for msg in log['messages']:
+            pcs = msg.split('~')
+            if len(pcs) < 2:
+                continue
+            pcs = pcs[1].split(' ')
+            if int(pcs[8]) > res:
+                res = int(pcs[8])
+    return res + 1
 
 
 def active_app_intervals(logs, start, end):
@@ -172,46 +215,125 @@ def active_app_intervals(logs, start, end):
     return res
 
 
-def activity(trial, logs):
+def visited_pages(logs, start, end):
+    # Return pages visited for each day in the given interval. The start
+    # and end values are milliseconds since Epoch. Return value looks
+    # like this:
+    # [
+    #   [ { 'url': URL, 'visits': count }, ... ],   # Pages of day 1
+    #   [ { 'url': URL, 'visits': count }, ... ],   # Pages of day 2
+    #   ...
+    # ]
+    #
+    def add_url(urls, url):
+        for u in urls:
+            if u['url'] == url:
+                u['visits'] = u['visits'] + 1
+                break
+        else:
+            urls.append({ 'url': url, 'visits': 1 })
+
+    dayct = round((end - start) / g_msecpd)
+    days = [ [] for x in range(dayct) ]
+    for log in logs:
+        for msg in log['messages']:
+            pcs = msg.split('~')
+            if len(pcs) < 2 or pcs[0] != 'Navigation':
+                continue
+            pcs = pcs[1].split(' ')
+            ts = int(pcs[8])
+            if ts >= start and ts < end:
+                dn = int((ts - start) / g_msecpd)
+                add_url(days[dn], pcs[9])
+    return days
+
+
+def time_of_day(ms):
+    s = round(ms / 1000)
+    noon = 12 * 60 * 60
+    if s == 0:
+        ampm = 'midnight'
+    elif s == noon:
+        ampm = 'noon'
+    elif s < noon:
+        ampm = 'am'
+    else:
+        ampm = 'pm'
+    if s >= noon:
+        s -= noon
+    seconds = s % 60
+    s = int(s / 60)
+    minutes = s % 60
+    s = int(s / 60)
+    hours = s
+    if hours == 0:
+        hours = 12
+    return '{:d}:{:0>2d}:{:0>2d} {}'.format(hours, minutes, seconds, ampm)
+
+def activity(trial, fotrial, logs):
+    # Summarize activity between beginning of trial and beginning of the
+    # following trial (if any).
+    #
+    # A time of day looks like this: "9:30:00 am"
+    #
     # For each day:
     # month, day, year
-    # reminder_times { type => millisec after midnight }
+    # reminder_times { type => time of day }
     #    types from remdescs
-    # report_times { type => millisec after midnight }
-    #    types: morning, breakfast, lunch, symptom, confirm
-    # report_histories { type => array of millisec after midnight }
+    # reports { type => report_obj }
+    #    types: morning, breakfast, lunch, symptom
+    #    report_obj: { time: time of day, value: <<Value of report>> }
+    # report_histories { type => array of time of day }
     #    types: breakfast, lunch, symptom
-    # active: array of (millisec after midnight, millisec of duration)
+    # active: array of (time of day, seconds of duration)
+    # visited_pages: array of { url: url, visits: count }
     #
-    secpd = 24 * 60 * 60 # Seconds per day
 
-    def hist_times(hist, midn):
+    def rep_sum(midn, ts, val):
+        # Make a report summary. midn is beginning of report day, ts is
+        # time of report. Both are Unix style (seconds since 1970).
+        # timestamp of the returned summary is milliseconds since the
+        # beginning of the report day. val is the value of the report
+        # (depends on report type).
+        #
+        return { 'time': time_of_day((ts - midn) * 1000), 'value': val }
+
+    def hist_times(midn, hist):
         # A history is a list of dicts each with a report time in
         # seconds. Return a list of just the times scaled to millisec
-        # and rebased to the given midnight.
+        # and rebased to the given midnight (Unix style).
         #
-        return map(lambda d: d['report_time'] * 1000 - midn, hist)
+        return map(lambda d: time_of_day((d['report_time'] - midn) * 1000),
+                    hist)
 
+    # Our report period is from the start of the trial to the start of
+    # the next trial (or the end of the logs if there's no following
+    # trial).
+    #
     startms = trial['start_time'] * 1000
-    endms = trial['end_time'] * 1000
+    if (fotrial):
+        endms = fotrial['start_time'] * 1000
+    else:
+        endms = end_of_log(logs)
+
     intervals = active_app_intervals(logs, startms, endms)
     intervix = 0
+    vpages = visited_pages(logs, startms, endms)
 
     res = []
 
-    days = round((trial['end_time'] - trial['start_time']) / secpd)
+    days = round((endms - startms) / g_msecpd)
     for dx in range(days):
-        midn = trial['start_time'] + dx * secpd # Beginning of the trial day
+        midn = round((startms + dx * g_msecpd) / 1000)
         dxdate = datetime.date.fromtimestamp(midn)
         dayob = {}
         dayob['day'] = dxdate.day;
         dayob['month'] = dxdate.month;
         dayob['year'] = dxdate.year;
-        midn = midn * 1000                      # Scaled to millisec
         remob = {}
         if 'remdescrs' in trial:
             for rd in trial['remdescrs']:
-                remob[rd['type']] = rd['time'] * 1000 
+                remob[rd['type']] = time_of_day(rd['time'] * 1000 )
         dayob['reminder_times'] = remob
         repob = {}
         histob = {}
@@ -222,37 +344,42 @@ def activity(trial, logs):
                 repdx = trial['reports'][dx]
             if 'morning_reminded_time' in repdx:
                 repob['morning'] = \
-                    repdx['morning_reminded_time'] * 1000 - midn
+                    rep_sum(midn, repdx['morning_reminded_time'],
+                            repdx['morning_reminded'])
             if 'breakfast_report_time' in repdx:
                 repob['breakfast'] = \
-                    repdx['breakfast_report_time'] * 1000 - midn
+                    rep_sum(midn, repdx['breakfast_report_time'],
+                            repdx['breakfast_compliance'])
             if 'lunch_report_time' in repdx:
                 repob['lunch'] = \
-                    repdx['lunch_report_time'] * 1000 - midn
+                    rep_sum(midn, repdx['lunch_report_time'],
+                            repdx['lunch_compliance'])
             if 'symptom_report_time' in repdx:
                 repob['symptom'] = \
-                    repdx['symptom_report_time'] * 1000 - midn
-            if 'confirmed_time' in repdx:
-                repob['confirm'] = \
-                    repdx['confirmed_time'] * 1000 - midn
+                    rep_sum(midn, repdx['symptom_report_time'],
+                            repdx['symptom_scores'])
+#           if 'confirmed_time' in repdx:
+#               repob['confirm'] = \
+#                   repdx['confirmed_time'] * 1000 - midn
             if 'breakfast_history' in repdx:
                 histob['breakfast'] = \
-                    hist_times(repdx['breakfast_history'], midn)
+                    hist_times(midn, repdx['breakfast_history'])
             if 'lunch_history' in repdx:
                 histob['lunch'] = \
-                    hist_times(repdx['lunch_history'], midn)
+                    hist_times(midn, repdx['lunch_history'])
             if 'symptom_history' in repdx:
                 histob['symptom'] = \
-                    hist_times(repdx['symptom_history'], midn)
-        dayob['report_times'] = repob
+                    hist_times(midn, repdx['symptom_history'])
+        dayob['reports'] = repob
         dayob['report_histories'] = histob
-        tomw = midn + secpd * 1000
+        tomw = midn * 1000 + g_msecpd
         active = []
         while intervix < len(intervals) and intervals[intervix][0] < tomw:
-            relms = intervals[intervix][0] - midn # Relative to midnight
-            active.append((relms, intervals[intervix][1]))
+            relms = intervals[intervix][0] - (midn * 1000)
+            active.append((time_of_day(relms), intervals[intervix][1]/1000))
             intervix = intervix + 1
         dayob['active'] = active
+        dayob['visited_pages'] = vpages[dx]
         res.append(dayob)
 
     return res
@@ -275,8 +402,9 @@ def main():
     if trial == None:
         print('activity: no trial found', file=sys.stderr)
         sys.exit(1)
+    fotrial = find_following_trial(docs, trial)
     logs = find_log_docs(docs)
-    actob = activity(trial, logs)
+    actob = activity(trial, fotrial, logs)
     json.dump(actob, sys.stdout, default=lambda o: o.__dict__,
                         sort_keys=True, indent=4)
 
