@@ -107,35 +107,56 @@ def find_log_docs(docs):
 
 # A log message looks like this:
 # 
-#   Category~rest of message
+#   Category~DATE [SEVERITY] rest of message
 #
 # Categories right now are: Activity, Navigation
 #
-# Rest of message has space-separated fields. Assume any new fields will
-# be added at the end. At the front right now for Activity messages
-# there are the following:
+# DATE has different forms, probably depending on iOS preferences
+# settings.
 #
-#   0 - 6  Date and time
-#   7      [INFO]
-#   8      Timestamp
-#   9      URL
-#   10     Trial id
-#   11     Event type (appActive, appPause, etc.)
+# SEVERITY is the severity level of the message. Currently the logging
+# module uses only the INFO level.
+#
+# Rest of message has whitespace-separated fields. Assume any new fields
+# will be added at the end. Right now for Activity messages there are
+# the following:
+#
+#   0   Timestamp
+#   1   URL of currently active page
+#   2   Trial id
+#   3   Event type (appActive, appPause, etc.)
 # 
 
-# Navigation messages have the following fields:
 #
-#   0 - 6  Date and time
-#   7      [INFO]
-#   8      Timestamp
-#   9      URL
-#   10     Trial id
-#   11     Event type ($locationChangeSuccess)
-#   12     Timestamp of navigational touch
-#   13     Attribute that did navigation (ui-sref)
-#   14     Containing HTML element (A)
-#   15     Text inside the HTML element (quoted string)
+# Navigation messages have the following rest of message:
+#
+#   0   Timestamp
+#   1   URL of currently active page
+#   2   Trial id
+#   3   Event type ($locationChangeSuccess)
+#   4   Timestamp of navigational touch
+#   5   Attribute that did navigation (ui-sref)
+#   6   Containing HTML element (A)
+#   7+  Text inside the HTML element (quoted string)
 # 
+
+def log_line_parse(line):
+    # Parse the log line, which has one of the layouts given above.
+    # Return a pair (category, rest). Category is 'Activity' or
+    # 'Navigation'. Rest is the "rest of message" as a list of strings.
+    # If the line has an unrecognizable format, return None.
+    #
+    # For simplicity, just split on whitespace. Later, might want to
+    # parse the 7th field of Navigation messages more carefully.
+    #
+    pcs = line.split('~')
+    if len(pcs) < 2:
+        return None
+    ix = pcs[1].find(']') # Skip past severity
+    if ix < 0:
+        return None
+    rest = pcs[1][ix + 1 :].split()
+    return (pcs[0].strip(), rest)
 
 
 def end_of_log(logs):
@@ -145,12 +166,12 @@ def end_of_log(logs):
     res = -1
     for log in logs:
         for msg in log['messages']:
-            pcs = msg.split('~')
-            if len(pcs) < 2:
+            catpcs = log_line_parse(msg)
+            if catpcs == None:
                 continue
-            pcs = pcs[1].split(' ')
-            if int(pcs[8]) > res:
-                res = int(pcs[8])
+            (cat, pcs) = catpcs
+            if int(pcs[0]) > res:
+                res = int(pcs[0])
     return res + 1
 
 
@@ -172,16 +193,18 @@ def active_app_intervals(logs, start, end):
     closer = None # Possible closer for trailing open interval
     for log in logs:
         for msg in log['messages']:
-            pcs = msg.split('~')
-            if len(pcs) < 2 or pcs[0] != 'Activity':
+            catpcs = log_line_parse(msg)
+            if catpcs == None:
                 continue
-            pcs = pcs[1].split(' ')
-            ts = int(pcs[8])
+            (cat, pcs) = catpcs
+            if cat != 'Activity':
+                continue
+            ts = int(pcs[0])
             if ts >= start and ts < end:
-                events.append((ts, pcs[11]))
-            if ts >= end and stop_evt(pcs[11]):
+                events.append((ts, pcs[3]))
+            if ts >= end and stop_evt(pcs[3]):
                 if closer == None or ts < closer[0]:
-                    closer = (ts, pcs[11])
+                    closer = (ts, pcs[3])
 
     events.sort(key=lambda ab: ab[0])
 
@@ -233,18 +256,20 @@ def visited_pages(logs, start, end):
         else:
             urls.append({ 'url': url, 'visits': 1 })
 
-    dayct = round((end - start) / g_msecpd)
+    dayct = int((end - start + g_msecpd - 1) / g_msecpd)
     days = [ [] for x in range(dayct) ]
     for log in logs:
         for msg in log['messages']:
-            pcs = msg.split('~')
-            if len(pcs) < 2 or pcs[0] != 'Navigation':
+            catpcs = log_line_parse(msg)
+            if catpcs == None:
                 continue
-            pcs = pcs[1].split(' ')
-            ts = int(pcs[8])
+            (cat, pcs) = catpcs
+            if cat != 'Navigation':
+                continue
+            ts = int(pcs[0])
             if ts >= start and ts < end:
                 dn = int((ts - start) / g_msecpd)
-                add_url(days[dn], pcs[9])
+                add_url(days[dn], pcs[1])
     return days
 
 
