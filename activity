@@ -303,8 +303,9 @@ def activity(trial, fotrial, logs):
         # seconds. Return a list of just the times scaled to millisec
         # and rebased to the given midnight (Unix style).
         #
-        return map(lambda d: time_of_day((d['report_time'] - midn) * 1000),
-                    hist)
+        def rt(d):
+            return time_of_day((d['report_time'] - midn) * 1000)
+        return list(map(rt, hist))
 
     # Our report period is from the start of the trial to the start of
     # the next trial (or the end of the logs if there's no following
