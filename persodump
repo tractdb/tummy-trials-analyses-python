@@ -37,7 +37,7 @@ class DBDump:
         print('\n]')
 
     def _format_server_url(self, user, password):
-        return 'https://' + user + ':' + password + '@tractdb.org/couch/'
+        return 'https://' + user + ':' + password + '@tractdb.org/ttcouch/'
 
 
 def main():
